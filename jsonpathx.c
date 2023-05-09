@@ -1,7 +1,15 @@
 #include "postgres.h"
 
+#include "catalog/pg_type_d.h"
+#include "catalog/pg_operator_d.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/supportnodes.h"
+#include "parser/parse_func.h"
+#include "parser/parse_oper.h"
+#include "utils/fmgroids.h"
 #include "utils/jsonpath.h"
 
 typedef struct JsonPathContext
@@ -393,4 +401,140 @@ jsonpath_embed_vars(PG_FUNCTION_ARGS)
 				 errmsg("cannot embed non-scalar jsonpath variables")));
 
 	PG_RETURN_JSONPATH_P(jsp);
+}
+
+static Const *
+getConstExpr(Expr *expr, Oid typid)
+{
+	if (!IsA(expr, Const) ||
+		((Const *) expr)->constisnull ||
+		((Const *) expr)->consttype != typid)
+		return NULL;
+
+	return (Const *) expr;
+}
+
+/* Planner support for jsonb_path_match() and jsonb_path_exists() */
+static Node *
+jsonb_path_support(Node *rawreq, bool exists)
+{
+	Node       *ret = NULL;
+
+	if (IsA(rawreq, SupportRequestIndexCondition))
+	{
+		/* Try to convert operator/function call to index conditions */
+		SupportRequestIndexCondition *req = (SupportRequestIndexCondition *) rawreq;
+
+		/*
+		 * Currently we have no "reverse" match operators with the pattern on
+		 * the left, so we only need consider cases with the indexkey on the
+		 * left.
+		 */
+		if (req->indexarg != 0)
+			return NULL;
+
+		if (is_funcclause(req->node))
+		{
+			FuncExpr   *clause = (FuncExpr *) req->node;
+			Expr	   *opexpr;
+			Expr	   *jspexpr;
+			Expr	   *jsonexpr;
+			Const	   *pathexpr;
+			Const	   *varsexpr;
+			Const	   *silentexpr;
+			Jsonb	   *vars;
+			Oid			oproid;
+
+			if (list_length(clause->args) < 4)
+				return NULL;
+
+			if (!(pathexpr = getConstExpr(lsecond(clause->args), JSONPATHOID)))
+				return NULL;
+
+			if (!(silentexpr = getConstExpr(lfourth(clause->args), BOOLOID)) ||
+				!DatumGetBool(silentexpr->constvalue))
+				return NULL;
+
+			if ((varsexpr = getConstExpr(lthird(clause->args), JSONBOID)))
+			{
+				vars = DatumGetJsonbP(varsexpr->constvalue);
+
+				if (!JsonContainerIsObject(&vars->root))
+					return NULL;
+
+				if (JsonContainerSize(&vars->root) <= 0)
+					jspexpr = (Expr *) pathexpr;
+				else
+				{
+					JsonPath   *jsp = DatumGetJsonPathP(pathexpr->constvalue);
+
+					jsp = substituteVariables(jsp, vars);
+
+					if (!jsp)
+						return NULL;
+
+					jspexpr = (Expr *) makeConst(JSONPATHOID, -1, InvalidOid,
+												 -1, PointerGetDatum(jsp),
+												 false, false);
+				}
+			}
+			else
+			{
+				List	   *args = list_make2(pathexpr, lthird(clause->args));
+				Oid			argoids[] = { JSONPATHOID, JSONBOID };
+				List	   *funcname = list_make1(makeString("jsonpath_embed_vars"));
+				Oid			jsonpath_embed_vars_oid = LookupFuncName(funcname, 2, argoids, true);
+
+				if (!OidIsValid(jsonpath_embed_vars_oid))
+					return NULL;
+
+				jspexpr = (Expr *) makeFuncExpr(jsonpath_embed_vars_oid,
+												JSONPATHOID, args,
+												InvalidOid, InvalidOid,
+												COERCE_EXPLICIT_CALL);
+			}
+
+			jsonexpr = linitial(clause->args);
+
+			/* oproid = exists ? JsonbPathExistsOperator : JsonbPathMatchOperator; */
+			oproid = LookupOperName(NULL, list_make2(makeString("pg_catalog"),
+													 makeString(exists ? "@?" : "@@")),
+									JSONBOID, JSONPATHOID, true, -1);
+
+			if (!OidIsValid(oproid))
+				return NULL;
+
+			opexpr = make_opclause(oproid, BOOLOID, false,
+								   jsonexpr, jspexpr,
+								   InvalidOid, req->indexcollation);
+
+			req->lossy = false;
+
+			return (Node *) list_make1(opexpr);
+		}
+	}
+
+	return ret;
+}
+
+PG_FUNCTION_INFO_V1(jsonb_path_match_support);
+
+/* Planner support for jsonb_path_match() */
+Datum
+jsonb_path_match_support(PG_FUNCTION_ARGS)
+{
+	Node       *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	PG_RETURN_POINTER(jsonb_path_support(rawreq, false));
+}
+
+PG_FUNCTION_INFO_V1(jsonb_path_exists_support);
+
+/* Planner support for jsonb_path_exists() */
+Datum
+jsonb_path_exists_support(PG_FUNCTION_ARGS)
+{
+	Node       *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	PG_RETURN_POINTER(jsonb_path_support(rawreq, true));
 }
